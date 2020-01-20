@@ -88,6 +88,18 @@ _blocktype(::Type{S}) where {S<:Number} = S
 
 blocktype(h::Hamiltonian{LA,L,M}) where {LA,L,M} = M
 
+promote_blocktype(hs::Hamiltonian...) = promote_blocktype(blocktype.(hs)...)
+promote_blocktype(s1::Type, s2::Type, ss::Type...) =
+    promote_blocktype(promote_blocktype(s1, s2), ss...)
+promote_blocktype(::Type{SMatrix{N1,N1,T1,NN1}}, ::Type{SMatrix{N2,N2,T2,NN2}}) where {N1,NN1,T1,N2,NN2,T2} =
+    SMatrix{max(N1, N2), max(N1, N2), promote_type(T1, T2), max(NN1,NN2)}
+promote_blocktype(T1::Type{<:Number}, T2::Type{<:Number}) = promote_type(T1, T2)
+promote_blocktype(T::Type) = T
+
+blockdim(h::Hamiltonian) = blockdim(blocktype(h))
+blockdim(::Type{S}) where {N,S<:SMatrix{N,N}} = N
+blockdim(::Type{T}) where {T<:Number} = 1
+
 function nhoppings(ham::Hamiltonian)
     count = 0
     for h in ham.harmonics
@@ -121,106 +133,82 @@ _nnzdiag(s::Matrix) = count(!iszero, s[i,i] for i in 1:minimum(size(s)))
 
 # Iteration tools #
 
-# struct IndicesNonzeros{H}
-#     h::H
-# end
-# indicesnonzeros(h) = IndicesNonzeros(h)
-
-# function Base.iterate(itr::IndicesNonzeros{<:Hamiltonian}, (nptr, col, nhar) = (1, 1, 1))
-#     nhar > length(itr.h.harmonics) && return nothing
-#     har = itr.h.harmonics[nhar]
-#     i = _iterate(har, (nptr, col))
-#     if i === nothing
-#         return iterate(itr, (1, 1, nhar + 1))
-#     else
-#         ((row, col), (nptr, col)) = i
-#         return (row, col, har.dn), (nptr, col, nhar)
-#     end
-# end
-
-# function Base.iterate(itr::IndicesNonzeros{<:HamiltonianHarmonic}, state = (1, 1))
-#     _iterate(itr.h, state)
-# end
-
-# function _iterate(har::HamiltonianHarmonic{<:Any,<:Any,<:AbstractSparseMatrix}, (nptr, col))
-#     col > size(har.h, 2) && return nothing
-#     ptrs = nzrange(har.h, col)
-#     nptr > length(ptrs) && return _iterate(har, (1, col + 1))
-#     rows = rowvals(har.h)
-#     return (rows[ptrs[nptr]], col), (nptr + 1, col)
-# end
-
-# function _iterate(har::HamiltonianHarmonic{<:Any,<:Any,<:DenseMatrix}, (row, col))
-#     col > size(har.h, 2) && return nothing
-#     for row´ in row :size(har.h, 1)
-#         iszero(har.h[row´, col]) || return (row´, col), (row´ + 1, col)
-#     end
-#     return _iterate(har, (1, col + 1))
-# end
-
-# Base.IteratorSize(::IndicesNonzeros) = Base.HasLength()
-# Base.length(s::IndicesNonzeros{<:Hamiltonian}) = sum(har -> _nnz(har.h), s.h.harmonics)
-# Base.length(s::IndicesNonzeros{<:HamiltonianHarmonic}) = _nnz(s.h.h)
-# Base.IteratorEltype(::IndicesNonzeros) = Base.HasEltype()
-# Base.eltype(s::IndicesNonzeros{<:Hamiltonian}) = Tuple{Int, Int, typeof(first(s.h.harmonics).dn)}
-# Base.eltype(s::IndicesNonzeros{<:HamiltonianHarmonic}) = Tuple{Int, Int}
-
 struct IndicesNonzeros{H}
     h::H
     rowrange::UnitRange{Int}
     colrange::UnitRange{Int}
 end
-indicesnonzeros(h, rowrange = 1:size(h, 1), colrange = 1:size(h, 2)) =
-    IndicesNonzeros(h, rowrange, colrange)
 
-function Base.iterate(itr::IndicesNonzeros{<:Hamiltonian},
-                      (nptr, col, nhar) = (firstrow(itr), first(itr.colrange), 1))
+indicesnonzeros(h, rowrange = 1:size(h, 1), colrange = 1:size(h, 2)) =
+    IndicesNonzeros(h, rclamp(rowrange, 1:size(h, 1)), rclamp(colrange, 1:size(h, 2)))
+
+function firststate(itr::IndicesNonzeros{<:Hamiltonian}, nhar)
+    m = itr.h.harmonics[nhar].h
+    row, col = nextnonzero_row_col(m, itr)
+    return (row, col, nhar)
+end
+
+function nextnonzero_row_col(m::DenseMatrix, itr, col = first(itr.colrange))
+    for col´ in col:last(itr.colrange), row in itr.rowrange
+        iszero(m[row, col´]) || return (row, col´)
+    end
+    # (0, 0) is sentinel for "no non-zero row for col´ >= col
+    return (0, 0)
+end
+
+function nextnonzero_row_col(m::AbstractSparseMatrix, itr, col = first(itr.colrange))
+    rows = rowvals(m)
+    for col´ in col:last(itr.colrange)
+        ptridx = findfirst(p -> isvalidrowcol(rows[p], col´, m, itr), nzrange(m, col´))
+        ptridx === nothing || return (ptridx, col´)
+    end
+    # (0, 0) is sentinel for "no non-zero row for col´ >= col
+    return (0, 0)
+end
+
+isvalidrowcol(row, col, m, itr) = row in itr.rowrange && !iszero(m[row, col])
+
+function Base.iterate(itr::IndicesNonzeros{<:Hamiltonian}, (ptridx, col, nhar) = firststate(itr, 1))
     nhar > length(itr.h.harmonics) && return nothing
     har = itr.h.harmonics[nhar]
-    i = _iterate(har, (nptr, col, itr.rowrange, itr.colrange))
+    i = _iterate(har.h, itr, ptridx, col)
     if i === nothing
-        return iterate(itr, (1, 1, nhar + 1))
+        nhar´ = nhar + 1
+        return nhar´ > length(itr.h.harmonics) ? nothing : iterate(itr, firststate(itr, nhar´))
     else
-        ((row, col), (nptr, col)) = i
-        return (row, col, har.dn), (nptr, col, nhar)
+        ((row, col), (ptridx, col)) = i
+        return (row, col, har.dn), (ptridx, col, nhar)
     end
 end
 
-function Base.iterate(itr::IndicesNonzeros{<:HamiltonianHarmonic},
-                     (row, col) = (firstrow(itr), first(itr.colrange)))
-    _iterate(itr.h, (row, col, itr.rowrange, itr.colrange))
+firststate(itr::IndicesNonzeros{<:HamiltonianHarmonic}) = nextnonzero_row_col(itr.h.h, itr)
+
+function Base.iterate(itr::IndicesNonzeros{<:HamiltonianHarmonic}, (row, col) = firststate(itr))
+    _iterate(itr.h.h, itr, row, col)
 end
 
-# firstrow is either a rowval pointer or a row index, depending on the matrix
-firstrow(itr::IndicesNonzeros{<:Hamiltonian{<:Any,<:Any,<:Any,<:AbstractSparseMatrix}}) = 1
-firstrow(itr::IndicesNonzeros{<:Hamiltonian{<:Any,<:Any,<:Any,<:DenseMatrix}}) =
-    first(itr.rowrange)
-firstrow(itr::IndicesNonzeros{<:HamiltonianHarmonic{<:Any,<:Any,<:AbstractSparseMatrix}}) = 1
-firstrow(itr::IndicesNonzeros{<:HamiltonianHarmonic{<:Any,<:Any,<:DenseMatrix}}) =
-    first(itr.rowrange)
-
-function _iterate(har::HamiltonianHarmonic{<:Any,<:Any,<:AbstractSparseMatrix}, (nptr, col, rowrange, colrange))
-    col > last(colrange) && return nothing
-    ptrs = nzrange(har.h, col)
-    rows = rowvals(har.h)
-    if nptr <= length(ptrs)
-        row = rows[ptrs[nptr]]
-        row <= last(rowrange) && return (row, col), (nptr + 1, col)
+# Returns nothing or ((row, col), (nextrow, nextcol)), where row and nextrow can be a ptridx
+function _iterate(m::AbstractSparseMatrix, itr, ptridx, col)
+    col in itr.colrange || return nothing  # will also return nothing if col == 0 (sentinel)
+    ptrs = nzrange(m, col)
+    rows = rowvals(m)
+    if ptridx <= length(ptrs)
+        row = rows[ptrs[ptridx]]
+        isvalidrowcol(row, col, m, itr) && return (row, col), (ptridx + 1, col)
     end
-    return _iterate(har, (1, col + 1, rowrange, colrange))
+    ptridx´, col´ = nextnonzero_row_col(m, itr, col + 1)
+    return _iterate(m, itr, ptridx´, col´)
 end
 
-function _iterate(har::HamiltonianHarmonic{<:Any,<:Any,<:DenseMatrix}, (row, col, rowrange, colrange))
-    col > last(colrange) && return nothing
-    for row´ in row:last(rowrange)
-        iszero(har.h[row´, col]) || return (row´, col), (row´ + 1, col)
+function _iterate(m::DenseMatrix, itr, row, col)
+    col in itr.colrange || return nothing
+    for row´ in row:last(itr.rowrange)
+        iszero(m[row´, col]) || return (row´, col), (row´ + 1, col)
     end
-    return _iterate(har, (first(rowrange), col + 1, rowrange, colrange))
+    row´, col´ = nextnonzero_row_col(m, itr, col + 1)
+    return _iterate(m, itr, row´, col´)
 end
 
-# Base.IteratorSize(::IndicesNonzeros) = Base.HasLength()
-# Base.length(s::IndicesNonzeros{<:Hamiltonian}) = sum(har -> _nnz(har.h), s.h.harmonics)
-# Base.length(s::IndicesNonzeros{<:HamiltonianHarmonic}) = _nnz(s.h.h)
 Base.IteratorSize(::IndicesNonzeros) = Base.SizeUnknown()
 Base.IteratorEltype(::IndicesNonzeros) = Base.HasEltype()
 Base.eltype(s::IndicesNonzeros{<:Hamiltonian}) = Tuple{Int, Int, typeof(first(s.h.harmonics).dn)}
@@ -379,7 +367,7 @@ sanitize_orbs(p) = throw(ArgumentError("Wrong format for orbitals, see `hamilton
 Base.Matrix(h::Hamiltonian) = Hamiltonian(h.lattice, Matrix.(h.harmonics), h.field, h.orbitals)
 Base.Matrix(h::HamiltonianHarmonic) = HamiltonianHarmonic(h.dn, Matrix(h.h))
 
-Base.copy(h::Hamiltonian) = Hamiltonian(h.lattice, copy.(h.harmonics), h.field, h.orbitals)
+Base.copy(h::Hamiltonian) = Hamiltonian(copy(h.lattice), copy.(h.harmonics), h.field, h.orbitals)
 Base.copy(h::HamiltonianHarmonic) = HamiltonianHarmonic(h.dn, copy(h.h))
 
 Base.size(h::Hamiltonian, n) = size(first(h.harmonics).h, n)
@@ -403,7 +391,22 @@ issemibounded(h::Hamiltonian) = issemibounded(h.lattice)
 nsites(h::Hamiltonian) = isempty(h.harmonics) ? 0 : nsites(first(h.harmonics))
 nsites(h::HamiltonianHarmonic) = size(h.h, 1)
 
+nsublats(h::Hamiltonian) = nsublats(h.lattice)
+
 norbitals(h::Hamiltonian) = length.(h.orbitals)
+
+# External API #
+
+"""
+    transform!(h::Hamiltonian, f::Function)
+
+Transform the site positions of the Hamiltonian's lattice in place without modifying the
+Hamiltonian harmonics.
+"""
+function transform!(h::Hamiltonian, f::Function)
+    transform!(h.lattice, f)
+    return h
+end
 
 # Indexing #
 
@@ -462,10 +465,27 @@ end
 IJV{L,M}(dn::SVector{L} = zero(SVector{L,Int})) where {L,M} =
     IJV(dn, Int[], Int[], M[])
 
-function IJVBuilder(::Type{M}, lat::AbstractLattice{E,L,T}, orbs) where {E,L,T,M}
-    ijvs = IJV{L,M}[]
+function IJVBuilder(lat::AbstractLattice{E,L,T}, orbs, ijvs::Vector{IJV{L,M}}) where {E,L,T,M}
     kdtrees = Vector{KDTree{SVector{E,T},Euclidean,T}}(undef, nsublats(lat))
     return IJVBuilder(lat, orbs, ijvs, kdtrees)
+end
+
+IJVBuilder(lat::AbstractLattice{E,L}, orbs, ::Type{M}) where {E,L,M} =
+    IJVBuilder(lat, orbs, IJV{L,M}[])
+
+function IJVBuilder(lat::AbstractLattice{E,L}, orbs, hs::Hamiltonian...) where {E,L}
+    M = promote_blocktype(hs...)
+    ijvs = IJV{L,M}[]
+    builder = IJVBuilder(lat, orbs, ijvs)
+    offset = 0
+    for h in hs
+        for har in h.harmonics
+            ijv = builder[har.dn]
+            push_block!(ijv, har, offset)
+        end
+        offset += size(h, 1)
+    end
+    return builder
 end
 
 function Base.getindex(b::IJVBuilder{L,M}, dn::SVector{L2,Int}) where {L,L2,M}
@@ -489,26 +509,45 @@ function Base.resize!(h::IJV, n)
     return h
 end
 
-Base.push!(h::IJV, (i, j, v)) = (push!(h.i, i); push!(h.j, j); push!(h.v, v))
+Base.push!(ijv::IJV, (i, j, v)::Tuple) = (push!(ijv.i, i); push!(ijv.j, j); push!(ijv.v, v))
+
+function push_block!(ijv::IJV{L,M}, h::HamiltonianHarmonic, offset) where {L,M}
+    I, J, V = findnz(h.h)
+    for (i, j, v) in zip(I, J, V)
+        push!(ijv, (i + offset, j + offset, padtotype(v, M)))
+    end
+    return ijv
+end
 
 #######################################################################
 # hamiltonian_sparse
 #######################################################################
-function hamiltonian_sparse(::Type{M}, lat::AbstractLattice{E,L}, orbs, model; field = missing) where {E,L,M}
-    checkmodelorbs(model, orbs, lat)
-    builder = IJVBuilder(M, lat, orbs)
-    applyterms!(builder, terms(model)...)
-    HT = HamiltonianHarmonic{L,M,SparseMatrixCSC{M,Int}}
-    n = nsites(lat)
-    harmonics = HT[HT(e.dn, sparse(e.i, e.j, e.v, n, n)) for e in builder.ijvs if !isempty(e)]
-    return Hamiltonian(lat, harmonics, Field(field, lat), orbs, n, n)
+function hamiltonian_sparse(Mtype, lat, orbs, model; field = missing)
+    builder = IJVBuilder(lat, orbs, Mtype)
+    return hamiltonian_sparse!(builder, lat, orbs, model, Field(field, lat))
 end
+
+function hamiltonian_sparse!(builder::IJVBuilder{L,M}, lat::AbstractLattice{E,L}, orbs, model, field) where {E,L,M}
+    checkmodelorbs(model, orbs, lat)
+    applyterms!(builder, terms(model)...)
+    n = nsites(lat)
+    HT = HamiltonianHarmonic{L,M,SparseMatrixCSC{M,Int}}
+    harmonics = HT[HT(e.dn, sparse(e.i, e.j, e.v, n, n)) for e in builder.ijvs if !isempty(e)]
+    return Hamiltonian(lat, harmonics, field, orbs, n, n)
+end
+
 
 applyterms!(builder, terms...) = foreach(term -> applyterm!(builder, term), terms)
 
-function applyterm!(builder::IJVBuilder{L,M}, term::OnsiteTerm) where {L,M}
+applyterm!(builder::IJVBuilder, term::Union{OnsiteTerm, HoppingTerm}) =
+    applyterm!(builder, term, sublats(term, builder.lat))
+
+applyterm!(builder::IJVBuilder, ndterm::NondiagonalTerm) =
+    applyterm!(builder, ndterm.term, sublats(ndterm, builder.lat))
+
+function applyterm!(builder::IJVBuilder{L,M}, term::OnsiteTerm, termsublats) where {L,M}
     lat = builder.lat
-    for s in sublats(term, lat)
+    for s in termsublats
         is = siterange(lat, s)
         dn0 = zero(SVector{L,Int})
         ijv = builder[dn0]
@@ -523,10 +562,10 @@ function applyterm!(builder::IJVBuilder{L,M}, term::OnsiteTerm) where {L,M}
     return nothing
 end
 
-function applyterm!(builder::IJVBuilder{L,M}, term::HoppingTerm) where {L,M}
+function applyterm!(builder::IJVBuilder{L,M}, term::HoppingTerm, termsublats) where {L,M}
     checkinfinite(term)
     lat = builder.lat
-    for (s1, s2) in sublats(term, lat)
+    for (s1, s2) in termsublats
         is, js = siterange(lat, s1), siterange(lat, s2)
         dns = dniter(term.dns, Val(L))
         for dn in dns
@@ -713,6 +752,31 @@ function add_or_push!(hs::Vector{<:HamiltonianHarmonic}, dn, matrix::AbstractMat
     newh = HamiltonianHarmonic(dn, matrix)
     push!(hs, newh)
     return newh
+end
+
+#######################################################################
+# combine
+#######################################################################
+"""
+    combine(hams::Hamiltonian...; coupling = missing)
+
+Build a new Hamiltonian `h` that combines all `hams` as diagonal blocks, and applies
+`coupling::Model`, if provided, to build the off-diagonal couplings. Note that the diagonal
+blocks are not modified by the coupling model. Any field in the source Hamiltonians is
+removed.
+"""
+combine(hams::Hamiltonian...; coupling = missing) = _combine(coupling, hams...)
+
+_combine(::Missing, hams...) = _combine(TightbindingModel(), hams...)
+
+function _combine(model::TightbindingModel, hams::Hamiltonian...)
+    lat = combine((h -> h.lattice).(hams)...)
+    orbs = tuplejoin((h -> h.orbitals).(hams)...)
+    builder = IJVBuilder(lat, orbs, hams...)
+    model´ = nondiagonal(model, nsublats.(hams))
+    field = Field(missing, lat)
+    ham = hamiltonian_sparse!(builder, lat, orbs, model´, field)
+    return ham
 end
 
 #######################################################################
